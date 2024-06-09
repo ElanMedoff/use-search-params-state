@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useEffect } from "react";
+import { useSyncExternalStore } from "use-sync-external-store/shim";
 import {
   defaultParse,
   defaultStringify,
@@ -6,25 +7,22 @@ import {
   isWindowUndefined,
 } from "./helpers";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function useStableCallback<TCb extends (...args: any[]) => any>(
-  cb: TCb,
-): TCb {
+function useStableCallback<Cb extends (...args: any[]) => any>(cb: Cb): Cb {
   const cbRef = React.useRef(cb);
-  cbRef.current = cb;
+  React.useEffect(() => {
+    cbRef.current = cb;
+  }, [cb]);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   return React.useCallback(
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-argument
-    ((...args) => cbRef.current(...args)) as TCb,
+    function (...args) {
+      return cbRef.current.call(this, ...args);
+    } as Cb,
     [],
   );
 }
 
 function useStableValue<Val>(val: Val) {
-  const valRef = React.useRef(val);
-  valRef.current = val;
-  return React.useCallback(() => valRef.current, []);
+  return useStableCallback(() => val);
 }
 
 interface UseSearchParamStateOptions<TVal> {
@@ -169,6 +167,34 @@ function useSearchParamState<TVal>(
   return useSearchParamStateInner<TVal>(searchParam, initialState, hookOptions);
 }
 
+const nativeEventNames = ["popstate"] as const;
+const customEventNames = ["pushState", "replaceState"] as const;
+const eventNames = [...nativeEventNames, ...customEventNames];
+
+// TODO: move this somewhere where it'll be executed once
+// from Wouter, originally from https://stackoverflow.com/a/4585031
+if (typeof history !== "undefined") {
+  for (const eventName of customEventNames) {
+    const original = history[eventName];
+    history[eventName] = function (...args) {
+      dispatchEvent(new Event(eventName));
+      return original.apply(this, args);
+    };
+  }
+}
+
+// from Wouter: https://github.com/molefrog/wouter/blob/e106a9dd27cde242b139e27fa8ac2fdb218fc523/packages/wouter/src/use-browser-location.js#L17
+const subscribeToEventUpdates = (callback: (event: Event) => void) => {
+  for (const eventName of eventNames) {
+    window.addEventListener(eventName, callback);
+  }
+  return () => {
+    for (const eventName of eventNames) {
+      window.removeEventListener(eventName, callback);
+    }
+  };
+};
+
 function useSearchParamStateInner<TVal>(
   searchParam: string,
   initialState: TVal,
@@ -210,11 +236,8 @@ function useSearchParamStateInner<TVal>(
   const { serverSideURL } = hookOptions;
 
   const stringify = useStableCallback(stringifyOption);
-  const parse = useStableCallback(parseOption);
   const pushState = useStableCallback(pushStateOption);
-  const sanitize = useStableCallback(sanitizeOption);
   const isEmptySearchParam = useStableCallback(isEmptySearchParamOption);
-  const validate = useStableCallback(validateOption);
   const buildOnError = useStableCallback(buildOnErrorOption);
   const hookOnError = useStableCallback(hookOnErrorOption);
   const getInitialState = useStableValue(initialState);
@@ -318,62 +341,68 @@ function useSearchParamStateInner<TVal>(
     ],
   );
 
-  const getSearchParam = React.useCallback(() => {
+  const getProccessedSearchParamVal = React.useCallback(
+    (rawSearchParamVal: string) => {
+      try {
+        const sanitized = sanitizeOption(rawSearchParamVal);
+        const parsed = parseOption(sanitized);
+        const validated = validateOption(parsed);
+
+        return validated;
+      } catch (e) {
+        hookOnError(e);
+        buildOnError(e);
+        return getInitialState();
+      }
+    },
+    [
+      buildOnError,
+      getInitialState,
+      hookOnError,
+      parseOption,
+      sanitizeOption,
+      validateOption,
+    ],
+  );
+
+  const getRawSearchParamVal = () => {
     try {
       const href = maybeGetHref();
       if (href === null) {
-        return getInitialState();
+        return null;
       }
 
       const url = new URL(href);
       const urlParams = url.searchParams;
-      const initialParamState = urlParams.get(searchParam);
-      if (initialParamState === null) {
-        return getInitialState();
+      const rawSearchParamVal = urlParams.get(searchParam);
+      if (rawSearchParamVal === null) {
+        return null;
       }
-
-      const sanitized = sanitize(initialParamState);
-      const parsed = parse(sanitized);
-      const validated = validate(parsed);
-
-      return validated;
+      return rawSearchParamVal;
     } catch (e) {
       hookOnError(e);
       buildOnError(e);
-      return getInitialState();
+      return null;
     }
-  }, [
-    buildOnError,
-    hookOnError,
-    maybeGetHref,
-    parse,
-    sanitize,
-    searchParam,
-    validate,
-    getInitialState,
-  ]);
+  };
 
-  React.useEffect(() => {
-    const onEvent = () => {
-      setState(getSearchParam());
-    };
-    window.addEventListener("popstate", onEvent);
-    return () => {
-      window.removeEventListener("popstate", onEvent);
-    };
-  }, [getSearchParam, setState]);
+  const getSnapshot = () => getRawSearchParamVal();
+  const rawSearchParamVal = useSyncExternalStore<string | null>(
+    subscribeToEventUpdates,
+    getSnapshot,
+    getSnapshot,
+  );
+  const currSearchParamState = React.useMemo(
+    () =>
+      rawSearchParamVal === null
+        ? getInitialState()
+        : getProccessedSearchParamVal(rawSearchParamVal),
+    [getInitialState, getProccessedSearchParamVal, rawSearchParamVal],
+  );
 
-  const [isFirstRender, setIsFirstRender] = React.useState(true);
-  const [serverState] = React.useState<TVal>(() => getSearchParam());
-
-  React.useEffect(() => {
-    setIsFirstRender(false);
-    setState(serverState);
-  }, [serverState, setState]);
-
-  const currSearchParamState = isFirstRender
-    ? serverState
-    : (globalSearchParams[searchParam]!.val as TVal);
+  useEffect(() => {
+    setState(currSearchParamState);
+  }, [currSearchParamState, setState]);
 
   const wrappedSetState = React.useCallback(
     (newVal: TVal | ((currVal: TVal) => TVal)) => {

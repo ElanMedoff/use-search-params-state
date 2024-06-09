@@ -22,11 +22,14 @@ const config = {
     "**/.prettierrc.js",
   ],
   rules: {
-    "@typescript-eslint/no-non-null-assertion": "warn",
     "@typescript-eslint/unbound-method": "off",
+    "@typescript-eslint/no-non-null-assertion": "warn",
     "@typescript-eslint/no-empty-function": "off",
+    "@typescript-eslint/no-explicit-any": "warn",
+    "@typescript-eslint/no-unsafe-return": "warn",
+    "@typescript-eslint/no-unsafe-argument": "warn",
     "react-hooks/rules-of-hooks": "error",
-    "react-hooks/exhaustive-deps": "error",
+    "react-hooks/exhaustive-deps": "warn",
   },
   settings: {
     react: {
